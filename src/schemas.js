@@ -1,20 +1,20 @@
 import { z } from 'zod';
 
-const description = z.string().trim().min(5).max(5000);
 const category = z.string().trim().min(1).max(100);
-const location = z.string().trim().max(200).optional();
+const location = z.string().trim().min(1).max(200);
 
 export const createIncidentSchema = z.object({
-  description,
+  description: z.string().trim().min(5).max(5000),
   category,
   location,
 });
 
+// Matching uses category + location only; any other fields sent are ignored
 export const checkIncidentSchema = z.object({
-  description,
   category,
   location,
   window_hours: z.number().int().min(1).max(720).optional(),
-  threshold: z.number().min(0).max(1).optional(),
   limit: z.number().int().min(1).max(50).optional(),
+  category_threshold: z.number().min(0).max(1).optional(),
+  location_threshold: z.number().min(0).max(1).optional(),
 });

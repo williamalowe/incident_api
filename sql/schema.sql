@@ -1,6 +1,6 @@
 -- Run this in the Supabase SQL Editor. Safe to re-run.
 
--- Trigram extension for fuzzy text similarity
+-- Trigram extension for fuzzy text matching
 create extension if not exists pg_trgm;
 
 -- ---------------------------------------------------------------
@@ -14,81 +14,101 @@ create table if not exists public.incidents (
   created_at   timestamptz not null default now()
 );
 
--- Lookups always start from the recent time window
-create index if not exists incidents_created_at_idx
-  on public.incidents (created_at desc);
-
 -- Lock the table down: with RLS on and no policies, only the
 -- service role key (used by the API) can read or write.
 alter table public.incidents enable row level security;
 
 -- ---------------------------------------------------------------
--- Similarity lookup, called from the API via supabase.rpc()
+-- Normalised text: ignores capitalisation and extra spaces
+-- ---------------------------------------------------------------
+create or replace function public.incident_key(value text)
+returns text
+language sql immutable
+as $$
+  select lower(regexp_replace(trim(value), '\s+', ' ', 'g'));
+$$;
+
+-- Old indexes from earlier versions (no longer used)
+drop index if exists public.incidents_title_trgm_idx;
+drop index if exists public.incidents_description_trgm_idx;
+drop index if exists public.incidents_category_created_idx;
+drop index if exists public.incidents_category_location_created_idx;
+
+-- Lookups start from the recent time window
+create index if not exists incidents_created_at_idx
+  on public.incidents (created_at desc);
+
+-- ---------------------------------------------------------------
+-- Similar-incident lookup, called from the API via supabase.rpc()
 --
--- Each recent incident gets a combined score between 0 and 1:
---   description: fuzzy text similarity (0-1)
---   category:    1 if it matches (case-insensitive), else 0
---   location:    fuzzy text similarity (0-1), 0 if either is missing
--- weighted by the p_weight_* parameters (which should add up to 1).
+-- An incident counts as similar when, within the time window, BOTH:
+--   category_score >= p_category_threshold
+--     word-level similarity, so "auth" ~ "authentication" and
+--     "network" ~ "networking"
+--   location_score >= p_location_threshold
+--     whole-string similarity, so "Melbourne office" ~
+--     "Melbourne Office Level 2" or "Melb office", but not "Sydney office"
+-- Scores run 0-1; an exact match (ignoring case/spaces) scores 1.
+-- Set a threshold to 1 to require an exact match for that field.
 -- ---------------------------------------------------------------
 
 -- Remove older versions of the function (different signatures)
 drop function if exists public.find_similar_incidents(text, text, text, text, int, real, int);
 drop function if exists public.find_similar_incidents(text, text, text, int, real, int);
 drop function if exists public.find_similar_incidents(text, text, text, int, real, int, real, real, real);
+drop function if exists public.find_similar_incidents(text, text, int, int);
+drop function if exists public.find_similar_incidents(text, text, int, int, real, real);
 
 create function public.find_similar_incidents(
-  p_description        text,
   p_category           text,
-  p_location           text default null,
+  p_location           text,
   p_window_hours       int  default 24,
-  p_threshold          real default 0.5,
-  p_limit              int  default 5,
-  p_weight_description real default 0.6,
-  p_weight_category    real default 0.2,
-  p_weight_location    real default 0.2
+  p_limit              int  default 10,
+  p_category_threshold real default 0.75,
+  p_location_threshold real default 0.6
 )
 returns table (
-  id                uuid,
-  description       text,
-  category          text,
-  location          text,
-  created_at        timestamptz,
-  description_score real,
-  category_match    boolean,
-  location_score    real,
-  similarity_score  real
+  id             uuid,
+  description    text,
+  category       text,
+  location       text,
+  created_at     timestamptz,
+  category_score real,
+  location_score real,
+  total_matches  bigint
 )
 language sql stable
 as $$
-  select * from (
+  select
+    s.id, s.description, s.category, s.location, s.created_at,
+    s.c_score, s.l_score,
+    count(*) over () as total_matches
+  from (
     select
-      s.id, s.description, s.category, s.location, s.created_at,
-      s.d_score, s.c_match, s.l_score,
-      (  p_weight_description * s.d_score
-       + p_weight_category    * (case when s.c_match then 1 else 0 end)
-       + p_weight_location    * s.l_score
-      )::real as total_score
-    from (
-      select
-        i.*,
-        similarity(i.description, p_description) as d_score,
-        lower(trim(i.category)) = lower(trim(p_category)) as c_match,
-        case
-          when i.location is null or p_location is null then 0::real
-          else similarity(i.location, p_location)
-        end as l_score
-      from public.incidents i
-      where i.created_at >= now() - make_interval(hours => p_window_hours)
-    ) s
-  ) t
-  where t.total_score >= p_threshold
-  order by t.total_score desc, t.created_at desc
+      i.*,
+      case
+        when public.incident_key(i.category) = public.incident_key(p_category) then 1::real
+        else greatest(
+          word_similarity(public.incident_key(p_category), public.incident_key(i.category)),
+          word_similarity(public.incident_key(i.category), public.incident_key(p_category))
+        )
+      end as c_score,
+      case
+        when i.location is null then 0::real
+        when public.incident_key(i.location) = public.incident_key(p_location) then 1::real
+        else similarity(public.incident_key(i.location), public.incident_key(p_location))
+      end as l_score
+    from public.incidents i
+    where i.created_at >= now() - make_interval(hours => p_window_hours)
+  ) s
+  where s.c_score >= p_category_threshold
+    and s.l_score >= p_location_threshold
+  order by (s.c_score + s.l_score) desc, s.created_at desc
   limit p_limit;
 $$;
 
 -- Only the backend should call this
-revoke execute on function public.find_similar_incidents(text, text, text, int, real, int, real, real, real)
+revoke execute on function public.find_similar_incidents(text, text, int, int, real, real)
   from public, anon, authenticated;
-grant execute on function public.find_similar_incidents(text, text, text, int, real, int, real, real, real)
+grant execute on function public.find_similar_incidents(text, text, int, int, real, real)
   to service_role;
