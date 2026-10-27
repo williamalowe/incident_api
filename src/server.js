@@ -1,4 +1,5 @@
-import { app } from './app.js';
+// Local development only. On Vercel, src/app.js is used directly.
+import app from './app.js';
 import { config } from './config.js';
 
 app.listen(config.port, () => {
