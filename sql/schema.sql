@@ -28,6 +28,40 @@ as $$
   select lower(regexp_replace(trim(value), '\s+', ' ', 'g'));
 $$;
 
+-- ---------------------------------------------------------------
+-- Street key: the location with house/unit numbers removed and
+-- common street abbreviations expanded, so "123 Fake street",
+-- "456 Fake St" and "Unit 4/456 Fake Street" all become "fake street".
+-- ---------------------------------------------------------------
+create or replace function public.street_key(value text)
+returns text
+language plpgsql immutable
+as $$
+declare
+  result text := ' ' || lower(coalesce(value, '')) || ' ';
+  pair text[];
+  abbreviations text[][] := array[
+    ['st', 'street'], ['rd', 'road'], ['ave', 'avenue'], ['av', 'avenue'],
+    ['dr', 'drive'], ['ct', 'court'], ['pl', 'place'], ['cres', 'crescent'],
+    ['cr', 'crescent'], ['hwy', 'highway'], ['pde', 'parade'], ['tce', 'terrace'],
+    ['blvd', 'boulevard'], ['ln', 'lane'], ['cl', 'close'], ['gr', 'grove'],
+    ['sq', 'square'], ['esp', 'esplanade'], ['cct', 'circuit'], ['pkwy', 'parkway']
+  ];
+begin
+  -- Punctuation (commas, slashes, hyphens, full stops) becomes spaces
+  result := regexp_replace(result, '[^a-z0-9 ]', ' ', 'g');
+  -- Drop any word containing a digit: 123, 4, 12a, 3rd
+  result := regexp_replace(result, '\m\S*[0-9]\S*\M', ' ', 'g');
+  -- Drop unit/level designators
+  result := regexp_replace(result, '\m(unit|units|apt|apartment|suite|shop|level|lvl|flat|lot|no)\M', ' ', 'g');
+  -- Expand street-type abbreviations
+  foreach pair slice 1 in array abbreviations loop
+    result := regexp_replace(result, '\m' || pair[1] || '\M', pair[2], 'g');
+  end loop;
+  return trim(regexp_replace(result, '\s+', ' ', 'g'));
+end;
+$$;
+
 -- Old indexes from earlier versions (no longer used)
 drop index if exists public.incidents_title_trgm_idx;
 drop index if exists public.incidents_description_trgm_idx;
@@ -43,13 +77,15 @@ create index if not exists incidents_created_at_idx
 --
 -- An incident counts as similar when, within the time window, BOTH:
 --   category_score >= p_category_threshold
---     word-level similarity, so "auth" ~ "authentication" and
---     "network" ~ "networking"
+--     word-level similarity, so "water leak" ~ "Water leaks"
 --   location_score >= p_location_threshold
---     whole-string similarity, so "Melbourne office" ~
---     "Melbourne Office Level 2" or "Melb office", but not "Sydney office"
+--     the better of two comparisons:
+--       - the full location text ("Melbourne office" ~ "Melb office")
+--       - the street key, ignoring house/unit numbers and abbreviations
+--         ("123 Fake street" = "456 Fake St" = "Unit 4/456 Fake Street")
 -- Scores run 0-1; an exact match (ignoring case/spaces) scores 1.
--- Set a threshold to 1 to require an exact match for that field.
+-- location_match says which comparison matched:
+--   'exact', 'same street' (only the numbers differ) or 'similar'.
 -- ---------------------------------------------------------------
 
 -- Remove older versions of the function (different signatures)
@@ -75,35 +111,57 @@ returns table (
   created_at     timestamptz,
   category_score real,
   location_score real,
+  location_match text,
   total_matches  bigint
 )
 language sql stable
 as $$
-  select
-    s.id, s.description, s.category, s.location, s.created_at,
-    s.c_score, s.l_score,
-    count(*) over () as total_matches
-  from (
+  with input as (
+    select
+      public.incident_key(p_category) as cat,
+      public.incident_key(p_location) as loc,
+      public.street_key(p_location)   as street
+  ),
+  scored as (
     select
       i.*,
       case
-        when public.incident_key(i.category) = public.incident_key(p_category) then 1::real
+        when public.incident_key(i.category) = inp.cat then 1::real
         else greatest(
-          word_similarity(public.incident_key(p_category), public.incident_key(i.category)),
-          word_similarity(public.incident_key(i.category), public.incident_key(p_category))
+          word_similarity(inp.cat, public.incident_key(i.category)),
+          word_similarity(public.incident_key(i.category), inp.cat)
         )
       end as c_score,
       case
         when i.location is null then 0::real
-        when public.incident_key(i.location) = public.incident_key(p_location) then 1::real
-        else similarity(public.incident_key(i.location), public.incident_key(p_location))
-      end as l_score
+        when public.incident_key(i.location) = inp.loc then 1::real
+        else similarity(public.incident_key(i.location), inp.loc)
+      end as full_score,
+      case
+        when i.location is null or inp.street = '' or public.street_key(i.location) = '' then 0::real
+        when public.street_key(i.location) = inp.street then 1::real
+        else similarity(public.street_key(i.location), inp.street)
+      end as street_score,
+      public.incident_key(i.location) = inp.loc as exact_loc,
+      public.street_key(i.location) = inp.street and inp.street <> '' as same_street
     from public.incidents i
+    cross join input inp
     where i.created_at >= now() - make_interval(hours => p_window_hours)
-  ) s
+  )
+  select
+    s.id, s.description, s.category, s.location, s.created_at,
+    s.c_score,
+    greatest(s.full_score, s.street_score) as l_score,
+    case
+      when s.exact_loc then 'exact'
+      when s.same_street then 'same street'
+      else 'similar'
+    end,
+    count(*) over () as total_matches
+  from scored s
   where s.c_score >= p_category_threshold
-    and s.l_score >= p_location_threshold
-  order by (s.c_score + s.l_score) desc, s.created_at desc
+    and greatest(s.full_score, s.street_score) >= p_location_threshold
+  order by (s.c_score + greatest(s.full_score, s.street_score)) desc, s.created_at desc
   limit p_limit;
 $$;
 
